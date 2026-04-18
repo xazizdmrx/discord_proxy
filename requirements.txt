@@ -1,0 +1,3 @@
+# dc_proxy — Discord için proxy / VPN profil yöneticisi
+pystray>=0.19.5
+Pillow>=10.0.0
