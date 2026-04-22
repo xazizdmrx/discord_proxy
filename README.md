@@ -50,12 +50,15 @@ Kayıtlı otomatik başlatma ile birlikte kullanılır; doğrudan test için:
 
 ## Ayar dosyaları
 
-- `%LOCALAPPDATA%\dc_proxy\settings.json` — Discord yolu ve çalışma seçenekleri  
+- `%LOCALAPPDATA%\dc_proxy\settings.json` — `discord_update_exe`, `discord_exe`, `discord_local_socks_port`, `connection_goal` (`socks` = proxy/SOCKS önerisi, `vpn` = tam VPN), çalışma seçenekleri  
 - `%LOCALAPPDATA%\dc_proxy\profiles.json` — bağlantı profilleri  
+- `%LOCALAPPDATA%\dc_proxy\dc_proxy.log` — tüm çalışma akışı (başlangıç, sekmeler, bağlan, tepsi, kayıt; max. ~512 KiB, dönen yedekler)  
+  - **Not:** Parolalar ve proxy URI’deki kimlik bilgisi dosyada **maskelenir**; yine de bu dosyayı paylaşmayın.  
 
 ## Notlar
 
-- VPN (OpenVPN) genelde **tüm trafiği** tünel eder; yalnızca Discord için kural gerekiyorsa Proxifier benzeri araçlarla kayıtlı `.exe` yolunu kullanın.  
+- **OpenVPN (Windows):** TAP / WFP için çoğu zaman **dc_proxy.exe / OpenVPN’i yönetici olarak çalıştırın**. Kimlik için **Kimlik dosyası** (iki satır `.txt`). Bağlanınca siyah konsol yerine çıktı **`%LOCALAPPDATA%\dc_proxy\openvpn_last.log`** dosyasına yazılır; işlem kaydında otomatik özetlenir. Proton’da kullanıcı adına `…+b:0` gibi ek gerekebilir (`.ovpn` yorumları).  
+- **OpenVPN = tam PC VPN’i** (varsayılan olarak internetin tamamı tünelden). *Sadece Discord* istiyorsanız OpenVPN ile “seçici” olmaz; **yerel SOCKS** (SSH tüneli, Shadowsocks/xray yerel port, sağlayıcı SOCKS5) + **Proxifier** (veya benzeri) ile **Update.exe** ve **Discord.exe** için kural verin. Proton’da “split tunneling” yalnızca tam istemci uygulamasında anlamlıdır; `.ovpn` ile OpenVPN dc_proxy’den açıldığında yine sistem geneli tünel davranışına yakınsır.  
 - Sistem tepsisi için `pip install pystray Pillow` zorunludur; yoksa “simge durumunda çalış” seçeneği tam çıkış önerir.
 
 ## Lisans

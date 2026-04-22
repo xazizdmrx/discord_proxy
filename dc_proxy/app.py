@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 import subprocess
 import sys
 import threading
@@ -13,8 +14,11 @@ from typing import Any
 from uuid import uuid4
 
 from . import profiles as profiles_mod
+from .discord_proxy_help import proxifier_guide_tr
+from .logutil import sanitize_log_line, setup_logging, startup_banner
 from .launcher import (
     build_preview_command,
+    openvpn_last_log_path,
     proxy_url_for,
     start_detached,
 )
@@ -26,6 +30,8 @@ from .theme import (
     configure_hint_widget,
     configure_text_widget,
 )
+
+_LOG_APP = logging.getLogger("dc_proxy.app")
 
 
 def _copy_to_clipboard(root: tk.Tk, text: str) -> None:
@@ -75,6 +81,9 @@ class ToolTip:
             self._tip.destroy()
             self._tip = None
 
+    def set_text(self, text: str) -> None:
+        self.text = text
+
 
 class DcProxyApp(tk.Tk):
     def __init__(self, *, start_hidden: bool = False) -> None:
@@ -95,9 +104,17 @@ class DcProxyApp(tk.Tk):
         self._form_canvas_win: int | None = None
         self._cli_start_hidden = bool(start_hidden)
         self._tray_icon: Any = None
+        self._admin_ovpn_warned = False
 
         self._build_ui()
         self._load_profile_list()
+
+        _LOG_APP.info(
+            "Uygulama hazır | start_hidden=%s profil=%s ayar=%s",
+            self._cli_start_hidden,
+            len(self._profiles),
+            list(self._settings.keys()),
+        )
 
         if sys.platform == "win32" and self._settings.get("start_with_windows"):
             from .windows_integration import sync_autostart_with_settings
@@ -105,6 +122,8 @@ class DcProxyApp(tk.Tk):
             ok, msg = sync_autostart_with_settings(self._settings)
             if not ok:
                 self._log(f"⚠️ Otomatik başlatma eşitlemesi: {msg}")
+            else:
+                logging.getLogger("dc_proxy.windows").info("Açılışta Run eşitlendi: %s", msg)
 
         self.protocol("WM_DELETE_WINDOW", self._on_user_close_window)
         self.after(500, self._maybe_start_hidden_from_cli)
@@ -136,10 +155,19 @@ class DcProxyApp(tk.Tk):
         ).pack(anchor=tk.W, pady=(8, 0))
 
         self.var_discord_exe = tk.StringVar(value=str(self._settings.get("discord_exe") or ""))
-        if not (self.var_discord_exe.get() or "").strip() and sys.platform == "win32":
-            guessed = profiles_mod.guess_discord_exe()
-            if guessed:
-                self.var_discord_exe.set(guessed)
+        self.var_discord_update_exe = tk.StringVar(value=str(self._settings.get("discord_update_exe") or ""))
+        self.var_discord_socks_port = tk.StringVar(
+            value=str(self._settings.get("discord_local_socks_port") or "1080")
+        )
+        if sys.platform == "win32":
+            if not (self.var_discord_update_exe.get() or "").strip():
+                u = profiles_mod.guess_discord_update_exe()
+                if u:
+                    self.var_discord_update_exe.set(u)
+            if not (self.var_discord_exe.get() or "").strip():
+                m = profiles_mod.guess_discord_main_exe()
+                if m:
+                    self.var_discord_exe.set(m)
 
         self._STEP_NAMES = ["Rehber", "Bağlantı", "Profiller", "Discord", "Program"]
 
@@ -175,8 +203,12 @@ class DcProxyApp(tk.Tk):
                 "① Rehber — bu sayfa\n"
                 "② Bağlantı — OpenVPN / SSH / proxy bilgilerinizi girin ve ▶️ Bağlan’a basın\n"
                 "③ Profiller — sık kullandığınız ayarı kaydedip tek tıkla yükleyin\n"
-                "④ Discord — Proxifier vb. için hangi Discord .exe kullanılacaksa seçin\n"
+                "④ Discord — Update.exe (önce güncelleme) + ana Discord.exe; uygulama bazlı proxyde ikisi için kural\n"
                 "⑤ Program — Windows ile başlatma, tepsi modu, tam çıkış\n\n"
+                "⚠️ OpenVPN / WireGuard «tam VPN»dir: tarayıcı, oyun, güncelleme… tüm trafik o tünelden gider. "
+                "Yalnızca Discord’un proxy/VPN kullanmasını istiyorsanız burada OpenVPN seçmeyin; "
+                "SSH tüneli (yerel SOCKS) veya SOCKS5/HTTP + Proxifier gibi «yalnızca seçtiğiniz program» "
+                "yönlendirmesi kullanın (Discord sekmesindeki exe yolları Proxifier kurallarında işe yarar).\n\n"
                 "Küçük ekranda dikey kaydırmayı unutmayın; her bölüm kendi sekmesindedir."
             ),
             style="CardMuted.TLabel",
@@ -188,6 +220,36 @@ class DcProxyApp(tk.Tk):
         tab_conn = ttk.Frame(self._notebook, padding=8)
         self._notebook.add(tab_conn, text="2  Bağlantı")
 
+        _cg_init = str(self._settings.get("connection_goal") or "socks").strip().lower()
+        if _cg_init not in ("socks", "vpn"):
+            _cg_init = "socks"
+        self.var_connection_goal = tk.StringVar(value=_cg_init)
+
+        goal_card = ttk.LabelFrame(tab_conn, text="🎚 Bağlantı amacı", padding=12)
+        goal_card.pack(fill=tk.X, pady=(0, 8))
+        ttk.Radiobutton(
+            goal_card,
+            text="Proxy / SOCKS — tam sistem VPN’i değil (Discord + Proxifier)",
+            variable=self.var_connection_goal,
+            value="socks",
+            command=self._on_connection_goal_changed,
+        ).pack(anchor=tk.W)
+        ttk.Radiobutton(
+            goal_card,
+            text="Tam sistem VPN (OpenVPN / WireGuard — genelde tüm trafik)",
+            variable=self.var_connection_goal,
+            value="vpn",
+            command=self._on_connection_goal_changed,
+        ).pack(anchor=tk.W, pady=(8, 0))
+        self._goal_hint_label = ttk.Label(
+            goal_card,
+            text="",
+            style="CardMuted.TLabel",
+            justify=tk.LEFT,
+            wraplength=900,
+        )
+        self._goal_hint_label.pack(anchor=tk.W, pady=(12, 0))
+
         proto_card = ttk.LabelFrame(tab_conn, text="🔌 Bağlantı türü", padding=12)
         proto_card.pack(fill=tk.X, pady=(0, 8))
 
@@ -198,10 +260,19 @@ class DcProxyApp(tk.Tk):
             state="readonly",
             width=56,
         )
-        self.combo_proto.set(proto_labels[0])
+        _init_proto_label = (
+            PROTOCOL_LABELS_TR["ssh_tunnel"]
+            if _cg_init == "socks"
+            else PROTOCOL_LABELS_TR["openvpn"]
+        )
+        self.combo_proto.set(_init_proto_label)
         self.combo_proto.pack(fill=tk.X, pady=(6, 0))
         self.combo_proto.bind("<<ComboboxSelected>>", self._on_proto_select)
-        ToolTip(self.combo_proto, "Önerilen sıra: önce OpenVPN, sonra SSH, sonra HTTP.\nListe bu sıraya göre düzenlendi.")
+        self._combo_tip = ToolTip(
+            self.combo_proto,
+            "«Proxy/SOCKS» modunda SSH veya SOCKS5 seçin; OpenVPN tam VPN’dir.",
+        )
+        self._refresh_connection_goal_hint()
 
         pw = ttk.PanedWindow(tab_conn, orient=tk.HORIZONTAL)
         pw.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
@@ -299,47 +370,108 @@ class DcProxyApp(tk.Tk):
         # --- Sekme 4: Discord ---
         tab_disc = ttk.Frame(self._notebook, padding=16)
         self._notebook.add(tab_disc, text="4  Discord")
-        discord_card = ttk.LabelFrame(tab_disc, text="🎮 Discord’un programı (.exe)", padding=14)
+        discord_card = ttk.LabelFrame(tab_disc, text="🎮 Discord’un programları (.exe)", padding=14)
         discord_card.pack(fill=tk.X)
         ttk.Label(
             discord_card,
             text=(
-                "Proxy’yi yalnızca Discord’a uygulamak için (Proxifier vb.) hangi exe dosyası "
-                "kullanılacaksa onu seçin.\n\n"
-                "Genelde:\n• Güncelleyici: …\\Discord\\Update.exe\n"
-                "• Asıl istemci: …\\Discord\\app-…\\Discord.exe\n\n"
-                "Tam VPN (OpenVPN) kullanırken bu yol çoğu zaman zorunlu değildir."
+                "Kısayol çoğu zaman önce güncelleme sürecini çalıştırır (“check for updates”). "
+                "Proxifier vb. ile uygulama bazlı proxy kullanıyorsanız "
+                "hem Update.exe hem ana Discord.exe için ayrı kurallar tanımlayın.\n\n"
+                "Tam sistem VPN’de (OpenVPN vb.) ek kural gerekmeyebilir."
             ),
             style="CardMuted.TLabel",
             justify=tk.LEFT,
             wraplength=780,
         ).pack(anchor=tk.W)
+
+        ttk.Label(
+            discord_card,
+            text="① Güncelleme önceliği — Update.exe (çoğu zaman ilk çalışan)",
+            style="FormMuted.TLabel",
+        ).pack(anchor=tk.W, pady=(14, 4))
+        row_u = ttk.Frame(discord_card)
+        row_u.pack(fill=tk.X)
+        self.entry_discord_update = ttk.Entry(row_u, textvariable=self.var_discord_update_exe)
+        self.entry_discord_update.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(row_u, text="📂", width=4, style="Ghost.TButton", command=self._browse_discord_update_exe).pack(
+            side=tk.RIGHT, padx=(8, 0)
+        )
+
+        ttk.Label(
+            discord_card,
+            text="② Ana pencere — app-…\\Discord.exe",
+            style="FormMuted.TLabel",
+        ).pack(anchor=tk.W, pady=(14, 4))
         disc_row = ttk.Frame(discord_card)
-        disc_row.pack(fill=tk.X, pady=(12, 0))
+        disc_row.pack(fill=tk.X)
         self.entry_discord = ttk.Entry(disc_row, textvariable=self.var_discord_exe)
         self.entry_discord.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Button(discord_card, text="📂 .exe seç…", style="Ghost.TButton", command=self._browse_discord_exe).pack(
-            fill=tk.X, pady=(10, 0)
+        ttk.Button(disc_row, text="📂", width=4, style="Ghost.TButton", command=self._browse_discord_main_exe).pack(
+            side=tk.RIGHT, padx=(8, 0)
         )
+
         disc_bt = ttk.Frame(discord_card)
-        disc_bt.pack(fill=tk.X, pady=(8, 0))
-        ttk.Button(disc_bt, text="🔎 Otomatik bul", style="Ghost.TButton", command=self._auto_discord_exe).pack(
+        disc_bt.pack(fill=tk.X, pady=(12, 0))
+        ttk.Button(disc_bt, text="🔎 İkisini otomatik bul", style="Ghost.TButton", command=self._auto_discord_exe).pack(
             side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 4)
         )
-        ttk.Button(disc_bt, text="💾 Yolu kaydet", style="Ghost.TButton", command=self._save_discord_exe_setting).pack(
+        ttk.Button(disc_bt, text="💾 Yolları kaydet", style="Ghost.TButton", command=self._save_discord_exe_setting).pack(
             side=tk.LEFT, expand=True, fill=tk.X, padx=(4, 0)
         )
+        launch_bt = ttk.Frame(discord_card)
+        launch_bt.pack(fill=tk.X, pady=(12, 0))
         ttk.Button(
-            discord_card,
-            text="🚀 Discord’u bu dosyadan başlat",
+            launch_bt,
+            text="🚀 Update ile başlat (önce güncelleme)",
             style="Ghost.TButton",
-            command=self._launch_discord_exe,
-        ).pack(fill=tk.X, pady=(12, 0))
-        ToolTip(
-            self.entry_discord,
-            "Proxifier / benzeri: kuralda bu exe’yi gösterirsiniz.\n"
-            "VPN (OpenVPN) kullanıyorsanız genelde tüm trafik zaten tüneldedir.",
-        )
+            command=self._launch_discord_update_exe,
+        ).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 6))
+        ttk.Button(
+            launch_bt,
+            text="💬 Discord.exe ile başlat",
+            style="Ghost.TButton",
+            command=self._launch_discord_main_exe,
+        ).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(6, 0))
+        ToolTip(self.entry_discord_update, "Proxifier’da ‘Update.exe’ kuralına bu tam yolu verin.")
+        ToolTip(self.entry_discord, "Proxifier’da ana istemci kuralına app klasöründeki Discord.exe.")
+
+        proxy_card = ttk.LabelFrame(tab_disc, text="🎯 Yalnızca Discord (proxy — tam VPN değil)", padding=14)
+        proxy_card.pack(fill=tk.X, pady=(16, 0))
+        ttk.Label(
+            proxy_card,
+            text=(
+                "OpenVPN bilgisayarın tamamını VPN yapar; «sadece Discord» için kullanmayın.\n"
+                "Önce Bağlantı sekmesinde SSH tüneli veya SOCKS5 ile yerel bir SOCKS noktası açın, "
+                "sonra Proxifier’da yalnızca aşağıdaki Update.exe ve Discord.exe yollarını o SOCKS’a yönlendirin.\n\n"
+                "Yerel dinleyicinin portu SSH/sağlayıcı ayarınıza göre değişir (çoğu örnek 1080)."
+            ),
+            style="CardMuted.TLabel",
+            justify=tk.LEFT,
+            wraplength=780,
+        ).pack(anchor=tk.W)
+        row_px = ttk.Frame(proxy_card)
+        row_px.pack(fill=tk.X, pady=(12, 0))
+        ttk.Label(row_px, text="Yerel SOCKS:", style="FormMuted.TLabel").pack(side=tk.LEFT)
+        ttk.Label(row_px, text="127.0.0.1", style="FormMuted.TLabel").pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(row_px, text="port", style="FormMuted.TLabel").pack(side=tk.LEFT, padx=(8, 4))
+        ent_px = ttk.Entry(row_px, textvariable=self.var_discord_socks_port, width=8)
+        ent_px.pack(side=tk.LEFT)
+        ToolTip(ent_px, "SSH -D / yerel SOCKS’un dinlediği port (genelde 1080). Kayıt: «Yolları kaydet».")
+        row_pc = ttk.Frame(proxy_card)
+        row_pc.pack(fill=tk.X, pady=(12, 0))
+        ttk.Button(
+            row_pc,
+            text="📋 Proxifier talimatını panoya kopyala",
+            style="Ghost.TButton",
+            command=self._copy_discord_proxifier_guide,
+        ).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 4))
+        ttk.Button(
+            row_pc,
+            text="🔌 Bağlantı sekmesi (SSH/SOCKS)",
+            style="Ghost.TButton",
+            command=self._focus_connection_tab,
+        ).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(4, 0))
 
         # --- Sekme 5: Program ---
         tab_prog = ttk.Frame(self._notebook, padding=16)
@@ -443,11 +575,21 @@ class DcProxyApp(tk.Tk):
             total = nb.index("end")
             name = self._STEP_NAMES[i] if i < len(self._STEP_NAMES) else ""
             self._step_banner.config(text=f"Adım {i + 1} / {total} — {name}")
+            logging.getLogger("dc_proxy.ui").info(
+                "Sekme | %s adım=%s/%s",
+                name,
+                i + 1,
+                total,
+            )
         except tk.TclError:
             pass
 
     def _persist_settings_from_vars(self) -> None:
         self._settings["discord_exe"] = (self.var_discord_exe.get() or "").strip()
+        self._settings["discord_update_exe"] = (self.var_discord_update_exe.get() or "").strip()
+        self._settings["discord_local_socks_port"] = (self.var_discord_socks_port.get() or "").strip() or "1080"
+        _cg = (self.var_connection_goal.get() or "socks").strip().lower()
+        self._settings["connection_goal"] = _cg if _cg in ("socks", "vpn") else "socks"
         self._settings["start_with_windows"] = bool(self.var_autostart.get())
         self._settings["start_hidden_to_tray"] = bool(self.var_start_hidden_tray.get())
         self._settings["minimize_to_tray_on_close"] = bool(self.var_tray_on_close.get())
@@ -481,7 +623,8 @@ class DcProxyApp(tk.Tk):
 
             build_icon_image()
             return True
-        except Exception:
+        except Exception as e:
+            logging.getLogger("dc_proxy.tray").warning("Tepsi bağımlılığı yok veya ikon hatası: %s", e)
             return False
 
     def _ensure_tray_running(self) -> None:
@@ -503,11 +646,13 @@ class DcProxyApp(tk.Tk):
             self._tray_icon.run()
 
         threading.Thread(target=run_icon, daemon=True).start()
+        logging.getLogger("dc_proxy.tray").info("Tepsi iş parçacığı başlatıldı")
 
     def _tray_show_window(self, icon: Any = None, item: Any = None) -> None:
         self.after(0, self._show_main_from_tray)
 
     def _show_main_from_tray(self) -> None:
+        logging.getLogger("dc_proxy.tray").info("Tepsiden ana pencere gösterildi")
         self.deiconify()
         self.lift()
         try:
@@ -546,8 +691,10 @@ class DcProxyApp(tk.Tk):
         self.withdraw()
         self._ensure_tray_running()
         self._log("ℹ️ Simge durumunda çalışıyor (tepsi). Çıkmak için tepsi menüsünü kullanın.")
+        logging.getLogger("dc_proxy.tray").info("Pencere tepsiye küçültüldü")
 
     def _quit_fully(self) -> None:
+        _LOG_APP.info("Tam çıkış başladı")
         self._stop_process(silent=True)
         if self._tray_icon is not None:
             try:
@@ -559,39 +706,58 @@ class DcProxyApp(tk.Tk):
             self.destroy()
         except tk.TclError:
             pass
+        _LOG_APP.info("Pencere destroy tamamlandı")
 
-    def _browse_discord_exe(self) -> None:
+    def _browse_discord_main_exe(self) -> None:
         path = filedialog.askopenfilename(
-            title="Discord ile ilgili .exe seçin",
+            title="Discord.exe seçin (app-… klasöründe)",
             filetypes=[("Windows uygulaması", "*.exe"), ("Tüm dosyalar", "*.*")],
         )
         if path:
             self.var_discord_exe.set(path)
-            self._log(f"📎 Seçilen program: {path}")
+            self._log(f"📎 Ana istemci: {path}")
+
+    def _browse_discord_update_exe(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Update.exe seçin (Discord klasörü)",
+            filetypes=[("Windows uygulaması", "*.exe"), ("Tüm dosyalar", "*.*")],
+        )
+        if path:
+            self.var_discord_update_exe.set(path)
+            self._log(f"📎 Güncelleme exe: {path}")
 
     def _auto_discord_exe(self) -> None:
-        guessed = profiles_mod.guess_discord_exe()
-        if guessed:
-            self.var_discord_exe.set(guessed)
-            self._log(f"🔎 Otomatik bulundu: {guessed}")
-            messagebox.showinfo("Tamam", f"Yol dolduruldu:\n{guessed}")
+        ug = profiles_mod.guess_discord_update_exe()
+        mn = profiles_mod.guess_discord_main_exe()
+        msg_parts: list[str] = []
+        if ug:
+            self.var_discord_update_exe.set(ug)
+            msg_parts.append(f"Update.exe:\n{ug}")
+        if mn:
+            self.var_discord_exe.set(mn)
+            msg_parts.append(f"Discord.exe:\n{mn}")
+        if msg_parts:
+            self._log("🔎 Otomatik:\n   " + "\n   ".join(msg_parts))
+            messagebox.showinfo("Tamam", "\n\n".join(msg_parts))
         else:
             messagebox.showinfo(
                 "Bulunamadı",
-                "Yaygın konumlarda Discord bulunamadı.\n\n"
-                "Explorer’da Discord kısayoluna sağ tıklayıp “Dosya konumunu aç” "
-                "diyerek .exe yolunu kopyalayabilirsiniz.",
+                "%LOCALAPPDATA%\\Discord altında yaygın yollar bulunamadı.\n\n"
+                "Kısayola sağ tıklayıp dosya konumundan exe seçin.",
             )
 
     def _save_discord_exe_setting(self) -> None:
         self._persist_settings_from_vars()
-        self._log("💾 Discord program yolu ve çalışma ayarları kaydedildi.")
-        messagebox.showinfo("Kaydedildi", "Discord .exe yolu ve seçenekler kaydedildi.")
+        self._log("💾 Discord exe yolları, yerel SOCKS portu ve çalışma ayarları kaydedildi.")
+        messagebox.showinfo(
+            "Kaydedildi",
+            "Update.exe, Discord.exe, yerel SOCKS portu ve çalışma ayarları kaydedildi.",
+        )
 
-    def _launch_discord_exe(self) -> None:
-        raw = (self.var_discord_exe.get() or "").strip()
+    def _launch_exe_path(self, raw: str, *, kind: str) -> None:
+        raw = (raw or "").strip()
         if not raw:
-            messagebox.showwarning("Eksik bilgi", "Önce Discord ile ilgili .exe dosyasını seçin.")
+            messagebox.showwarning("Eksik bilgi", f"{kind} için exe yolu boş.")
             return
         fp = Path(raw)
         if not fp.is_file():
@@ -599,9 +765,58 @@ class DcProxyApp(tk.Tk):
             return
         try:
             subprocess.Popen([str(fp)], cwd=str(fp.parent))
-            self._log(f"🚀 Discord (veya seçilen program) başlatıldı:\n   {fp}")
+            self._log(f"🚀 Başlatıldı ({kind}):\n   {fp}")
+            logging.getLogger("dc_proxy.discord").info("Harici exe başlatıldı | tür=%s yol=%s", kind, fp)
         except OSError as e:
+            logging.getLogger("dc_proxy.discord").error("Exe başlatılamadı | %s", e)
             messagebox.showerror("Başlatılamadı", str(e))
+
+    def _launch_discord_main_exe(self) -> None:
+        self._launch_exe_path(self.var_discord_exe.get(), kind="Discord.exe")
+
+    def _launch_discord_update_exe(self) -> None:
+        self._launch_exe_path(self.var_discord_update_exe.get(), kind="Update.exe")
+
+    def _parse_discord_local_socks_port(self) -> int | None:
+        raw = (self.var_discord_socks_port.get() or "").strip() or "1080"
+        try:
+            p = int(raw)
+        except ValueError:
+            return None
+        if 1 <= p <= 65535:
+            return p
+        return None
+
+    def _copy_discord_proxifier_guide(self) -> None:
+        port = self._parse_discord_local_socks_port()
+        if port is None:
+            messagebox.showwarning(
+                "Geçersiz port",
+                "Yerel SOCKS portu 1–65535 arasında bir sayı olmalı (ör. 1080).",
+            )
+            return
+        self._persist_settings_from_vars()
+        text = proxifier_guide_tr(
+            local_port=port,
+            update_exe=self.var_discord_update_exe.get(),
+            discord_exe=self.var_discord_exe.get(),
+        )
+        _copy_to_clipboard(self, text)
+        self._log(
+            f"📋 Proxifier talimatı panoya kopyalandı (yerel SOCKS 127.0.0.1:{port}). Proxifier kurulu olmalı."
+        )
+        messagebox.showinfo(
+            "Panoya kopyalandı",
+            "Proxifier adımları panoya yazıldı.\n\n"
+            "Önce Bağlantı sekmesinde yerel SOCKS’u açın; sonra Proxifier’da kuralları oluşturun.",
+        )
+
+    def _focus_connection_tab(self) -> None:
+        try:
+            self._notebook.select(1)
+            self._step_banner.config(text=f"Adım 2 / {len(self._STEP_NAMES)} — Bağlantı")
+        except tk.TclError:
+            pass
 
     def _set_hint_for_protocol(self, proto: str) -> None:
         text = PROTOCOL_HINTS_TR.get(proto, "Bu mod için ek bilgi yakında.")
@@ -615,6 +830,38 @@ class DcProxyApp(tk.Tk):
             if v == label:
                 return k
         return PROTOCOL_ORDER[0]
+
+    def _refresh_connection_goal_hint(self) -> None:
+        if self.var_connection_goal.get() == "vpn":
+            txt = (
+                "Bu seçenek OpenVPN / WireGuard gibi tam tünel içindir; tarayıcı ve diğer programlar da VPN üzerinden çıkar. "
+                "«Yalnızca Discord proxy» değildir."
+            )
+            tip = (
+                "Tam VPN: OpenVPN veya WireGuard. SOCKS/SSH yerel port açar ama Proxifier olmadan «sadece Discord» olmaz.\n"
+                "Liste sırası sabit; listeden istediğiniz türü seçebilirsiniz."
+            )
+        else:
+            txt = (
+                "OpenVPN bu modda kullanmayın — o tam bilgisayar VPN’idir. «SSH tüneli» veya «SOCKS5» ile yerel SOCKS "
+                "(çoğu kez 127.0.0.1:1080) açın; dc_proxy yalnızca bu süreci başlatır, Chrome/Edge’i otomatik tünele almaz. "
+                "Discord’u yönlendirmek için Discord sekmesi → Proxifier talimatı."
+            )
+            tip = (
+                "SSH tüneli: sunucuya bağlanır, bilgisayarınızda SOCKS dinler — bu tek başına tam VPN değildir.\n"
+                "SOCKS5: sağlayıcınızın verdiği uzak SOCKS; yine Proxifier ile yalnızca Discord’a verebilirsiniz.\n"
+                "OpenVPN seçerseniz tüm PC VPN olur; bu modun dışına çıkmış olursunuz."
+            )
+        self._goal_hint_label.config(text=txt)
+        self._combo_tip.set_text(tip)
+
+    def _on_connection_goal_changed(self) -> None:
+        self._persist_settings_from_vars()
+        self._refresh_connection_goal_hint()
+        g = self.var_connection_goal.get()
+        target = PROTOCOL_LABELS_TR["ssh_tunnel"] if g == "socks" else PROTOCOL_LABELS_TR["openvpn"]
+        self.combo_proto.set(target)
+        self._rebuild_form()
 
     def _on_proto_select(self, _ev: Any = None) -> None:
         self._rebuild_form()
@@ -689,6 +936,7 @@ class DcProxyApp(tk.Tk):
                 self._field_widgets[key] = var
 
         self._load_selected_profile()
+        logging.getLogger("dc_proxy.ui").debug("Form alanları güncellendi | protokol=%s", proto)
 
     def _collect_fields(self) -> dict[str, Any]:
         out: dict[str, Any] = {}
@@ -768,27 +1016,60 @@ class DcProxyApp(tk.Tk):
     def _connect(self) -> None:
         proto = self._current_protocol_key()
         fields = self._collect_fields()
+        logging.getLogger("dc_proxy.connect").info("Bağlan isteği | protokol=%s", proto)
         cmd, warn = build_preview_command(proto, fields)
         if warn:
             self._log(warn)
         if cmd:
             try:
+                if proto == "openvpn" and sys.platform == "win32":
+                    from .win_util import is_windows_admin
+
+                    if not is_windows_admin():
+                        self._log(
+                            "⚠️ Bu oturum yönetici değil — OpenVPN TAP/MTU ve WFP için yükseltme gerektirir. "
+                            "dc_proxy’yi sağ tık → «Yönetici olarak çalıştır» ile yeniden açın."
+                        )
+                        if not self._admin_ovpn_warned:
+                            self._admin_ovpn_warned = True
+                            messagebox.showwarning(
+                                "Yönetici önerilir",
+                                "OpenVPN bu bilgisayarda TAP, MTU veya Windows Filtering Platform (WFP) "
+                                "için yönetici hakları gerektirebilir.\n\n"
+                                "Günlükte «WFP: initialization failed» veya «Erişim engellendi» görüyorsanız "
+                                "uygulamayı kapatıp «Yönetici olarak çalıştır» ile yeniden başlatın.",
+                            )
                 self._stop_process()
                 self._current_pid = start_detached(cmd)
                 self._log("▶️ Komut: " + " ".join(cmd))
                 self._log(f"✅ Süreç başladı (PID {self._current_pid.pid}).")
+                if proto == "openvpn":
+                    lp = openvpn_last_log_path()
+                    self._log(
+                        "📄 OpenVPN metin günlüğü (siyah pencere yok): dosyaya yazılıyor.\n"
+                        f"   {lp}"
+                    )
+                    for ms in (1200, 4000):
+                        self.after(ms, self._preview_openvpn_log_tail)
             except Exception as e:  # noqa: BLE001
+                logging.getLogger("dc_proxy.connect").exception("Bağlantı süreci başlatılamadı: %s", e)
                 messagebox.showerror("❌ Hata", str(e))
                 self._log(str(e))
         else:
             uri = proxy_url_for(proto, fields)
             if uri:
+                logging.getLogger("dc_proxy.connect").info(
+                    "Proxy URI üretildi | protokol=%s örnek=%s",
+                    proto,
+                    sanitize_log_line(uri),
+                )
                 self._log("📋 Proxy adresi panoya yazıldı:\n   " + uri)
                 _copy_to_clipboard(self, uri)
                 messagebox.showinfo("✅ Tamam", "Proxy bağlantı satırı panoya kopyalandı.\nUygun programda yapıştırabilirsiniz.")
             elif warn:
                 messagebox.showwarning("⚠️ Dikkat", warn)
             else:
+                logging.getLogger("dc_proxy.connect").warning("Bağlan | eksik alan veya URI yok | protokol=%s", proto)
                 messagebox.showwarning("⚠️ Eksik bilgi", "Önce zorunlu alanları doldurun veya dosya seçin.")
 
     def _stop_process(self, *, silent: bool = False) -> None:
@@ -807,11 +1088,14 @@ class DcProxyApp(tk.Tk):
                         check=False,
                     )
                     self._log(f"⏹️ Süreç sonlandırıldı (PID {proc.pid}).")
+                    logging.getLogger("dc_proxy.connect").info("taskkill ile durduruldu | pid=%s", proc.pid)
                 else:
                     proc.terminate()
                     proc.wait(timeout=5)
                     self._log(f"⏹️ Süreç sonlandırıldı (PID {proc.pid}).")
+                    logging.getLogger("dc_proxy.connect").info("SIGTERM ile durduruldu | pid=%s", proc.pid)
         except Exception as e:  # noqa: BLE001
+            logging.getLogger("dc_proxy.connect").warning("Durdurma hatası: %s", e)
             self._log(f"⚠️ Durdurma: {e}")
 
     def _copy_proxy_uri(self) -> None:
@@ -835,7 +1119,28 @@ class DcProxyApp(tk.Tk):
                 "Bu bağlantı türü için tek satırlık adres üretilemedi veya eksik alan var.\nÖnce bilgileri tamamlayın.",
             )
 
-    def _log(self, line: str) -> None:
+    def _preview_openvpn_log_tail(self) -> None:
+        """OpenVPN --log-append dosyasının sonunu işlem kaydına kopyala."""
+        p = openvpn_last_log_path()
+        if not p.is_file():
+            return
+        try:
+            raw = p.read_text(encoding="utf-8", errors="replace")
+            lines = raw.splitlines()
+            if not lines:
+                return
+            tail = lines[-45:]
+            self._log("—— OpenVPN günlüğü (son satırlar) ——")
+            self._log("\n".join(tail))
+        except OSError as e:
+            self._log(f"⚠️ OpenVPN günlüğü okunamadı: {e}")
+
+    def _log(self, line: str, *, level: int = logging.INFO) -> None:
+        lg = logging.getLogger("dc_proxy.ui")
+        for ln in line.split("\n"):
+            t = ln.strip()
+            if t:
+                lg.log(level, sanitize_log_line(t))
         self.log.config(state=tk.NORMAL)
         self.log.insert(tk.END, line + "\n")
         self.log.see(tk.END)
@@ -845,6 +1150,11 @@ class DcProxyApp(tk.Tk):
 def run() -> None:
     import argparse
 
+    log_path = setup_logging()
+    startup_banner()
+    root_log = logging.getLogger("dc_proxy")
+    root_log.info("Günlük dosyası: %s", log_path)
+
     parser = argparse.ArgumentParser(description="dc_proxy — Discord için proxy / VPN profilleri")
     parser.add_argument(
         "--hidden",
@@ -852,5 +1162,10 @@ def run() -> None:
         help="Başlangıçta ana pencereyi gösterme (sistem tepsisi; oturum açılışı ile uyumlu)",
     )
     ns = parser.parse_args()
+    root_log.info("CLI argümanları | hidden=%s", ns.hidden)
+
     app = DcProxyApp(start_hidden=ns.hidden)
-    app.mainloop()
+    try:
+        app.mainloop()
+    finally:
+        root_log.info("mainloop sonlandı")

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shlex
@@ -11,8 +12,19 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .logutil import log_cmd_list
+
+_LOG = logging.getLogger("dc_proxy.launcher")
+
 
 DEFAULT_OPENVPN_WINDOWS = Path(r"C:\Program Files\OpenVPN\bin\openvpn.exe")
+
+
+def openvpn_last_log_path() -> Path:
+    """OpenVPN --log-append çıktısı (GUI’de gösterilir)."""
+    from .profiles import profiles_dir  # noqa: PLC0415
+
+    return profiles_dir() / "openvpn_last.log"
 
 
 def _split_extra_args(s: str | None) -> list[str]:
@@ -34,7 +46,18 @@ def launch_openvpn(fields: dict[str, Any]) -> tuple[list[str], str | None]:
     cfg = fields.get("config_path") or ""
     if not cfg or not Path(cfg).is_file():
         return [], "OpenVPN profil dosyası (.ovpn) seçin."
-    cmd = [exe, "--config", cfg] + _split_extra_args(fields.get("extra_args"))
+    cmd: list[str] = [exe, "--config", cfg]
+    auth_file = (fields.get("auth_pass_file") or "").strip()
+    if auth_file and Path(auth_file).is_file():
+        cmd.extend(["--auth-user-pass", str(Path(auth_file).resolve())])
+        _LOG.info("OpenVPN auth-user-pass dosyası kullanılacak | %s", Path(auth_file).name)
+    log_p = openvpn_last_log_path()
+    extra = _split_extra_args(fields.get("extra_args"))
+    if "--log-append" not in extra and "--log" not in extra:
+        cmd.extend(["--log-append", str(log_p)])
+        _LOG.info("OpenVPN günlük dosyası | %s", log_p)
+    cmd.extend(extra)
+    _LOG.info("OpenVPN komut hazır | config=%s arg_sayısı=%s", Path(cfg).name, len(cmd))
     return cmd, None
 
 
@@ -69,6 +92,7 @@ def launch_ssh(fields: dict[str, Any]) -> tuple[list[str], str | None]:
     ident = fields.get("identity_file")
     if ident and Path(str(ident)).is_file():
         cmd[1:1] = ["-i", str(ident)]
+    _LOG.info("SSH SOCKS komut hazır | hedef=%s@%s port=%s socks=%s:%s", user, host, bind, socks_port)
     return cmd, None
 
 
@@ -78,6 +102,7 @@ def launch_wireguard(fields: dict[str, Any]) -> tuple[list[str], str | None]:
         return [], "WireGuard .conf dosyası seçin."
     wg = fields.get("wg_quick_exe") or ""
     if wg and Path(wg).is_file():
+        _LOG.info("WireGuard komut hazır | conf=%s wg=%s", Path(cfg).name, Path(wg).name)
         return [wg, "up", str(cfg)], None
     return [], (
         "Windows'ta önce WireGuard istemcisine bu .conf'u ekleyin veya "
@@ -93,6 +118,7 @@ def launch_xray_like(protocol: str, fields: dict[str, Any]) -> tuple[list[str], 
     if not cfg or not Path(cfg).is_file():
         return [], "Yapılandırma JSON dosyası seçin."
     cmd = [binary, "run", "-c", str(cfg)] + _split_extra_args(fields.get("extra_args"))
+    _LOG.info("%s komut hazır | json=%s", protocol, Path(cfg).name)
     return cmd, None
 
 
@@ -111,14 +137,17 @@ def launch_shadowsocks(fields: dict[str, Any]) -> tuple[list[str], str | None]:
         td.write(raw)
         td.close()
         cmd = [binary, "-c", td.name]
+        _LOG.info("Shadowsocks geçici JSON yazıldı | dosya=%s", Path(td.name).name)
         return cmd, None
     extra = _split_extra_args(raw)
     cmd = [binary] + extra
+    _LOG.info("Shadowsocks komut hazır (satır argümanları) | arg_sayısı=%s", len(cmd))
     return cmd, None
 
 
 def build_preview_command(protocol: str, fields: dict[str, Any]) -> tuple[list[str], str | None]:
     fields = dict(fields)
+    _LOG.debug("build_preview_command | protokol=%s", protocol)
     if protocol == "openvpn":
         return launch_openvpn(fields)
     if protocol == "ssh_tunnel":
@@ -129,19 +158,28 @@ def build_preview_command(protocol: str, fields: dict[str, Any]) -> tuple[list[s
         return launch_shadowsocks(fields)
     if protocol in ("vmess", "vless", "trojan"):
         return launch_xray_like(protocol, fields)
+    _LOG.info("Komut üretilmedi | protokol=%s (URI modu)", protocol)
     return [], "Bu protokol için bağlantı komutu üretilmez; proxy dizesini panoya kopyalayın."
 
 
-def start_detached(cmd: list[str]) -> subprocess.Popen[Any]:
-    """Windows'ta yeni konsol veya arka planda süreç."""
+def start_detached(cmd: list[str], *, hide_console: bool = True) -> subprocess.Popen[Any]:
+    """Windows: varsayılan olarak konsol penceresi açılmaz (OpenVPN çıktısı --log-append ile dosyada)."""
+    log_cmd_list(_LOG, cmd, prefix="start_detached")
     creationflags = 0
     if sys.platform == "win32":
-        creationflags = subprocess.CREATE_NEW_CONSOLE  # type: ignore[attr-defined]
-    return subprocess.Popen(
+        if hide_console and hasattr(subprocess, "CREATE_NO_WINDOW"):
+            creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+        elif hide_console:
+            creationflags = 0x08000000
+        else:
+            creationflags = subprocess.CREATE_NEW_CONSOLE  # type: ignore[attr-defined]
+    proc = subprocess.Popen(
         cmd,
         creationflags=creationflags,
         cwd=os.getcwd(),
     )
+    _LOG.info("Alt süreç oluşturuldu | pid=%s hide_console=%s", proc.pid, hide_console)
+    return proc
 
 
 def proxy_url_for(protocol: str, fields: dict[str, Any]) -> str | None:

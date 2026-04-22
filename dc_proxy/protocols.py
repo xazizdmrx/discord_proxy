@@ -37,15 +37,20 @@ PROTOCOL_LABELS_TR = {
 # Kısa kullanım rehberi (yeni kullanıcılar için)
 PROTOCOL_HINTS_TR: dict[str, str] = {
     "openvpn": (
-        "① Sunucunuzdan aldığınız .ovpn dosyasını “Gözat” ile seçin.\n"
-        "② Bilgisayarda OpenVPN yüklü olmalı (genelde otomatik bulunur).\n"
-        "③ Bağlan’a basın — pencerede şifre sorulabilir.\n"
-        "💡 Discord çoğu zaman VPN ile birlikte çalışır; ek ayar gerekmez."
+        "⚠️ Bu mod tam sistem VPN’idir (tüm PC trafiği tünelden gider). Yalnızca Discord için proxy istiyorsanız "
+        "OpenVPN yerine SSH tüneli / SOCKS5 + Proxifier kullanın.\n\n"
+        "① .ovpn profilini ve (önerilen) kimlik dosyasını seçin.\n"
+        "② Kimlik dosyası: iki satır — 1. kullanıcı adı, 2. parola (UTF-8 metin).\n"
+        "③ Proton VPN: kullanıcı adına sunucu eki gerekebilir (ör. …+b:0) — .ovpn içindeki yorumlara bakın.\n"
+        "④ Windows’ta dc_proxy.exe veya OpenVPN’i «Yönetici olarak çalıştır» ile açın; aksi halde TAP/MTU veya «WFP: initialization failed» / «Erişim engellendi» oluşur.\n"
+        "⑤ Bağlan sizi siyah konsol açmaz; ayrıntı %LOCALAPPDATA%\\dc_proxy\\openvpn_last.log ve aşağıdaki işlem kaydında son satırlar olarak gelir.\n"
+        "💡 Tam VPN istiyorsanız: açıkken Discord da genelde ek ayarsız o yolu kullanır."
     ),
     "ssh_tunnel": (
         "① Sunucu adresi, kullanıcı adı ve (varsa) anahtar dosyası girin.\n"
         "② Yerel SOCKS portu (ör. 1080) sizin bilgisayarınızda açılır.\n"
         "③ Bağlan — sonra SOCKS adresini Proxifier vb. ile kullanın.\n"
+        "④ Yalnızca Discord istiyorsanız: Discord sekmesinde «Proxifier talimatını panoya kopyala».\n"
         "💡 Örnek adres: socks5://127.0.0.1:1080"
     ),
     "http": (
@@ -67,7 +72,8 @@ PROTOCOL_HINTS_TR: dict[str, str] = {
     "socks5": (
         "① SOCKS5 sunucu ve portunu girin.\n"
         "② Gerekirse kullanıcı/parola ekleyin.\n"
-        "③ Bağlan — panodaki socks5://… bağlantısını ilgili uygulamada kullanın."
+        "③ Bağlan — panodaki socks5://… bağlantısını ilgili uygulamada kullanın.\n"
+        "④ Uzak SOCKS doğrudan Proxifier’da da tanımlanabilir; yerel SSH SOCKS için Discord sekmesindeki talimatı kullanın."
     ),
     "ftp": (
         "① FTP proxy sunucusu ve portu (çoğu kez 21 veya sağlayıcıya özel).\n"
@@ -96,10 +102,11 @@ PROTOCOL_HINTS_TR: dict[str, str] = {
         "💡 Dosyalar güvenilir kaynaktan olmalıdır."
     ),
     "wireguard": (
+        "⚠️ Tam sistem VPN benzeri; trafik genelde tamamı tünelden gider — yalnızca Discord için SOCKS/SSH + Proxifier daha uygundur.\n\n"
         "① .conf dosyanızı seçin.\n"
         "② Windows’ta çoğu kez resmi WireGuard uygulamasına bu dosyayı ekleyin.\n"
         "③ İsteğe bağlı: wg-quick.exe tam yolu varsa burada kullanılır.\n"
-        "💡 VPN açıkken Discord genelde otomatik o yolu kullanır."
+        "💡 Tam VPN kullanıyorsanız Discord da çoğu kez otomatik o yolu kullanır."
     ),
 }
 
@@ -117,7 +124,15 @@ def fields_for(protocol: str) -> list[dict[str, Any]]:
         return [
             {"name": "OpenVPN exe", "key": "openvpn_exe", "widget": "file", "optional": True},
             {"name": "Profil (.ovpn)", "key": "config_path", "widget": "file", "filter": [("OpenVPN", "*.ovpn"), ("Tümü", "*.*")]},
-            {"name": "Ek argümanlar", "key": "extra_args", "widget": "entry", "optional": True, "placeholder": "--auth-user-pass veya boş"},
+            {
+                "name": "Kimlik dosyası (isteğe bağlı, --auth-user-pass)",
+                "key": "auth_pass_file",
+                "widget": "file",
+                "optional": True,
+                "filter": [("Metin", "*.txt"), ("Tümü", "*.*")],
+                "label": "Kimlik dosyası (2 satır: kullanıcı, parola)",
+            },
+            {"name": "Ek argümanlar", "key": "extra_args", "widget": "entry", "optional": True, "placeholder": "--auth-nocache veya boş"},
             common_note,
         ]
     if protocol == "ssh_tunnel":

@@ -3,10 +3,13 @@
 
 from __future__ import annotations
 
+import logging
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
+
+_LOG = logging.getLogger("dc_proxy.windows")
 
 RUN_VALUE_NAME = "DcProxy"
 _RUN_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -47,14 +50,18 @@ def set_autostart(enabled: bool, hidden: bool) -> tuple[bool, str]:
         if not enabled:
             try:
                 winreg.DeleteValue(key, RUN_VALUE_NAME)
+                _LOG.info("Run kaydı silindi | %s", RUN_VALUE_NAME)
             except FileNotFoundError:
+                _LOG.info("Run kaydı zaten yoktu | %s", RUN_VALUE_NAME)
                 pass
             except OSError as e:
+                _LOG.warning("Run silinemedi: %s", e)
                 return False, str(e)
             return True, "Otomatik başlatma kapatıldı."
 
         cmd = build_launch_command(hidden=hidden)
         winreg.SetValueEx(key, RUN_VALUE_NAME, 0, winreg.REG_SZ, cmd)
+        _LOG.info("Run kaydı yazıldı | hidden=%s komut_uzunluk=%s", hidden, len(cmd))
         return True, "Otomatik başlatma Windows’a kaydedildi."
     finally:
         winreg.CloseKey(key)
